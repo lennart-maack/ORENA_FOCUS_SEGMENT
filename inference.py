@@ -1,38 +1,14 @@
 """
-FOCUS SEGMENT-track algorithm: finetuned Qwen3.6-27B, no tools.
+Inference Code for the ORena FOCUS Challenge (SEGMENT-Track) using finetuned Qwen3.6-27B, no tools. (see trainer.py)
 
-The model is a LoRA-finetuned (merged) Qwen3.6-27B trained to map timestamped frames +
-question -> answer in the grader's exact format. Everything below reproduces the TRAINING
-protocol bit-for-bit -- sampling grid, timestamp strings, prompt, resolution, decoding.
-Deviating from any of it silently costs points (measured during development: a mismatched
-thinking-mode alone collapsed scores from ~42% to ~3%).
 
-Protocol (must match training):
+Protocol:
   * frames sampled on a uniform dt=2.5s grid over the clip, first AND last frame included,
-    capped at 121 (dt widens if a clip would exceed the cap). This is the grid recorded in
-    the checkpoint's RUN_CONFIG.json ("target_dt": "2.5"); the trainer logged 121 as the
-    longest row it saw. The previous 9B submission used 5 s / 64 frames -- training and
-    inference must agree or the temporal questions are answered off-grid;
+    capped at 121;
   * every frame is preceded by the text `[hh:mm:ss]` -- the ORIGINAL video timeline, i.e.
-    request.start_time + offset-in-clip (clips arrive pre-trimmed to the question window);
-  * frames resized so the longest side is <= 768 px, processor max_pixels=200704 (the value
-    in RUN_CONFIG.json; 768x432 sources render at 576x320, i.e. 180 tokens per frame);
-  * system prompt built by fo_prompt.py from FO_definitions.json -- the general foreign-object
-    rule, the class names, descriptions for the classes our training data cannot teach, and the
-    request's procedure_type. The SAME builder produced the training prompts, so this must stay
-    in lockstep with the checkpoint: a checkpoint trained without it must run with
-    USE_FO_PROMPT=False. The definitions are read from /input when the platform mounts them, so
-    a test-phase file with extra object classes flows straight into the prompt;
-  * chat template with add_generation_prompt=True and enable_thinking=False (Qwen3.5 is a
-    reasoning model; training used the empty-think pattern), anything before '</think>'
-    stripped from the decode, greedy decoding, max_new_tokens=256.
-
-Latency, measured on an H100 (80 GB) with this checkpoint merged, at 200704 px:
-frames   7    25    49    61   121
-time   0.5s  1.1s  2.5s  3.0s  5.8s     peak VRAM 51.6 -> 58.0 GiB, model load 41 s
-The worst question on this grid (121 frames) uses 5.8 s of the 15 s per-question budget and
-58 GiB of the card, so both have wide margins. A soft budget guard answers "" for remaining questions if the run ever
-nears the pooled limit, since an overrun >20% forfeits the whole batch.
+    request.start_time + offset-in-clip;
+  * frames resized so the longest side is <= 768 px, processor max_pixels=200704;
+  * system prompt built by fo_prompt.py from FO_definitions.json,
 """
 
 import json
