@@ -1,20 +1,6 @@
 #!/usr/bin/env python
-"""Self-contained LoRA SFT for Qwen3.5/3.6 (unified multimodal) on FOCUS QA -- no tools.
-
-Deliberately does not use ms-swift / LLaMA-Factory: Qwen3.5 is new enough to need transformers
-from main and the AutoModelForMultimodalLM class, and we do not want to fall back to Qwen3.
-
---calibrate-steps N runs only N optimiser steps and prints the projected time for one full
-epoch, so the epoch cost is known before committing to a full run.
-
-Speed knobs (all measured on the 27B, see scripts/hpc/README.md):
-  * the `fla` package: without it transformers runs the 48 Gated-DeltaNet layers through a
-    pure-torch chunked loop (63-step Python loop + one op-group per 64-token chunk, in forward,
-    recompute AND backward) -- measured 37 ms fwd / 896 ms bwd per layer at 12k tokens vs
-    2.4 / 6.2 ms with the Triton kernel. DISABLE_FLA=1 forces the torch path (fallback rung).
-  * --ckpt-every-n K: gradient-checkpoint only every K-th decoder layer (K=1 = every layer).
-    Recompute is a third of this LoRA run's FLOPs; K>1 trades activation memory for it.
-  * --fp8: FP8 GEMMs for the frozen base linears (fp8_frozen.py), no grad_weight GEMMs.
+"""
+Full training code (LoRA SFT) incl. dataset, dataloading etc. for Qwen3.5/3.6 ORENA FOCUS Challenge (SEGMENT Track) -- no tools are used here.
 """
 from __future__ import annotations
 
@@ -93,8 +79,7 @@ def frame_tokens(path: str, max_pixels: int) -> int:
 
 def estimate_len(row, max_pixels: int = 200704, base_text: int = BASE_TEXT) -> int:
     """Sequence length of a row in real tokens (validated against the processor: within ~2%).
-    The previous proxy assumed 256 tokens/frame from a 14-px patch; the model uses 16-px
-    patches, so 200704 px is ~180-195 tokens and a 16384 'budget' was really ~12.6k tokens."""
+    """
     imgs = row.get("images", [])
     if not imgs:
         return base_text
@@ -104,14 +89,6 @@ def estimate_len(row, max_pixels: int = 200704, base_text: int = BASE_TEXT) -> i
 
 class TokenBudgetBatchSampler(torch.utils.data.Sampler):
     """Variable-size batches holding <= `budget` PADDED tokens, grouped by length.
-
-    Half of this dataset is <=10 frames while the tail runs to 121, so a fixed batch size of 1
-    spends most of its forward/backward passes on tiny sequences at negligible GPU occupancy.
-    Packing length-similar rows to a token budget cuts the number of passes ~2.5x at 16k.
-
-    Shuffle -> mega-chunk -> sort inside the chunk -> fill batches -> shuffle batch order, so
-    rows still change partners every epoch instead of being frozen into a sorted order.
-    A row longer than the budget becomes its own batch; nothing is ever dropped.
     """
 
     def __init__(self, lengths, budget, mega_factor=256, seed=0):
@@ -164,12 +141,7 @@ class TokenBudgetBatchSampler(torch.utils.data.Sampler):
 
 
 class CkptPolicy:
-    """Per-micro-batch gradient-checkpointing density. A static 'every N-th layer' cannot fit:
-    the longest rows (121 frames, 23k tokens) need every layer checkpointed on 141 GB, while
-    the median batch (<=10k tokens) leaves half the card idle. Rules "<max_tokens>:<every_n>"
-    (every_n 0 = no checkpointing at all) are tried in order of max_tokens; a batch above the
-    last limit gets every layer checkpointed. Toggling the per-layer flag between steps is
-    safe with non-reentrant checkpointing (no static graph)."""
+    """Per-micro-batch gradient-checkpointing density."""
 
     def __init__(self, model, spec: str):
         self.rules = sorted((int(a), int(b)) for a, b in
@@ -199,11 +171,6 @@ class CkptPolicy:
 
 class AnswerLossTrainer(Trainer):
     """Cross-entropy on the supervised (answer) positions only, upcast AFTER selection.
-
-    The stock loss does `logits.float()` on the full [seq, vocab] tensor -- ~8GB for a
-    9k-token multimodal sequence with a 150k vocab, which OOMs the 32GB card. Only the
-    handful of answer tokens carry labels, so selecting them first shrinks the upcast to
-    megabytes with identical gradients.
     """
 
     LOGITS_TAIL = 192   # covers the longest answers (multi-timestamp lists) + chat suffix
@@ -214,9 +181,6 @@ class AnswerLossTrainer(Trainer):
         if self.batch_sampler_obj is None:
             return super().get_train_dataloader()
         from torch.utils.data import DataLoader
-        # NOTE: a plain (non-distributed) batch sampler on purpose -- accelerate's
-        # BatchSamplerShard then hands every Nth batch to rank N and pads the tail so all
-        # ranks run the SAME number of steps, which DDP requires or it deadlocks.
         dl = DataLoader(self.train_dataset, batch_sampler=self.batch_sampler_obj,
                         collate_fn=self.data_collator,
                         num_workers=self.args.dataloader_num_workers,
@@ -272,8 +236,6 @@ def is_dense(row) -> bool:
 
 
 def parse_target_dt(spec) -> tuple[float, float]:
-    """'2.5' -> (2.5, 2.5) uniform; '2.5/5' -> (2.5 dense, 5 normal), which is the grid
-    data_v2 was built on and the only one with a measured holdout score."""
     if spec in (None, "", 0, 0.0):
         return (0.0, 0.0)
     t = str(spec).split("/")
@@ -414,14 +376,7 @@ class Collator:
         return [Image.open(p).convert("RGB") for p in row["images"]]
 
     def prompt_len(self, full: str, prompt: str, imgs, enc, n_full: int) -> int:
-        """Number of prompt tokens (everything before the answer) in the rendered sequence.
-
-        The reference way runs the processor a SECOND time on prompt+images just to count
-        tokens -- that doubles the CPU image work per row (decode, resize, normalise, 121
-        frames in the long rows). The image tokens are identical in both renderings and the
-        prompt is a token-level prefix of the full text, so the difference between the two
-        TEXT-ONLY tokenisations (placeholders unexpanded) equals the difference between the
-        expanded ones. test_collator.py asserts equality with the two-pass count."""
+        """Number of prompt tokens (everything before the answer) in the rendered sequence."""
         if self.two_pass:
             return self.p(text=[prompt], images=imgs, return_tensors="pt")["input_ids"].shape[1]
         tok = self.p.tokenizer
@@ -439,9 +394,7 @@ class Collator:
             prompt = self.p.apply_chat_template(build_messages(row, False), tokenize=False,
                                                 add_generation_prompt=True)
             enc = self.p(text=[full], images=imgs, return_tensors="pt")
-            # NEVER truncate: chopping input_ids while keeping all pixel features desyncs
-            # image placeholders from vision features and the model refuses the batch.
-            # Sequence length is bounded by construction (frame cap x tokens/frame + text).
+            
             ids = enc["input_ids"][0]
             if len(ids) > self.max_len:
                 print(f"warn: sample len {len(ids)} > max_len {self.max_len}; kept whole")
@@ -450,19 +403,7 @@ class Collator:
             lab[:min(n_prompt, len(lab))] = -100          # supervise only the answer
             input_ids.append(ids)
             labels_list.append(lab)
-            # Vision tensors (pixel_values [patches, d], image_grid_thw [n_img, 3]) carry NO
-            # batch dim -- they are flattened across images. Keep them whole; concatenating
-            # along dim 0 across samples is the correct batch merge. Indexing [0] here ships
-            # one patch row / a 1-D grid and the model dies on grid_thw[:, 0].
-            # Two DIFFERENT kinds of extra tensor come back and they must be merged
-            # differently once a batch holds more than one row:
-            #   * sequence-aligned, shape [1, seq_len] (e.g. mm_token_type_ids, which marks the
-            #     image-placeholder positions) -> pad like input_ids, then stack.
-            #   * vision tensors carrying no batch dim (pixel_values [patches, d],
-            #     image_grid_thw [n_img, 3]) -> concatenate along dim 0.
-            # Concatenating the first kind blows up as soon as two rows differ in length
-            # ("Sizes of tensors must match except in dimension 0"), which never showed at
-            # batch size 1 because a single row is never concatenated with anything.
+            
             feat, seq_extra = {}, {}
             for k, v in enc.items():
                 if k in ("input_ids", "attention_mask") or not isinstance(v, torch.Tensor):
@@ -582,11 +523,7 @@ def setup_model(model_name: str, max_pixels: int, lora_rank: int, four_bit: bool
 
 
 def sdpa_context():
-    """SDPA backend priority from $SDPA_BACKEND (flash|cudnn), else no-op.
-
-    set_priority=True ORDERS the backends rather than disabling them, so any call the first
-    choice cannot serve (e.g. the vision tower's non-causal attention) falls through instead
-    of erroring. Measured 2026-09-03 on H200: flash vs cuDNN is a wash end to end."""
+    """SDPA backend priority from $SDPA_BACKEND (flash|cudnn), else no-op."""
     from torch.nn.attention import sdpa_kernel, SDPBackend
     order = {"cudnn": [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
                        SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH],
